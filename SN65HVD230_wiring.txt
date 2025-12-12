@@ -1,0 +1,52 @@
+ESP32-C6 + SN65HVD230 CAN Transceiver Wiring Guide
+=======================================================
+
+Pin Connections:
+----------------
+ESP32-C6 Pin  →  SN65HVD230 Pin  →  Description
+GPIO0         →  Pin 1 (D)       →  CAN TX (transmit data input)
+GPIO1         →  Pin 4 (R)       →  CAN RX (receive data output)
+3.3V          →  Pin 3 (VCC)     →  Power supply
+GND           →  Pin 2 (GND)     →  Ground
+              →  Pin 8 (Rs)      →  10kΩ resistor to GND (slope control)
+              →  Pin 7 (CANH)    →  CAN High line
+              →  Pin 6 (CANL)    →  CAN Low line
+
+Additional Components:
+----------------------
+1. 100nF ceramic capacitor between VCC (pin 3) and GND (pin 2)
+   - Place as close as possible to the transceiver
+
+2. 10kΩ resistor from Rs (pin 8) to GND
+   - Enables high-speed mode with ~15V/μs slew rate
+
+3. 120Ω termination resistor between CANH and CANL
+   - Required at BOTH ENDS of the CAN bus
+   - If testing with 2 devices, both need terminators
+
+CAN Bus Wiring:
+---------------
+Device 1 CANH  ────────────── Device 2 CANH
+               |             |
+             [120Ω]        [120Ω]
+               |             |
+Device 1 CANL  ────────────── Device 2 CANL
+
+Common GND between all devices is REQUIRED!
+
+Testing Setup:
+--------------
+For initial testing:
+1. Connect Rs pin to GND via 10kΩ
+2. Add 100nF cap at VCC
+3. Install 120Ω terminators at both devices
+4. Connect CANH to CANH
+5. Connect CANL to CANL
+6. Connect all GNDs together
+
+Troubleshooting:
+----------------
+- No communication: Check termination resistors (120Ω)
+- Unreliable: Check decoupling capacitor (100nF)
+- Bus errors: Verify Rs pin is connected (10kΩ to GND)
+- Random failures: Check all GND connections

@@ -1,26 +1,35 @@
 /*
- * ESP32-C6 USB to CAN Adapter
+ * ESP32-C6 USB to CAN Adapter with SN65HVD230 Transceiver
  *
- * This firmware implements a USB to CAN bus adapter using ESP32-C6 Mini.
- * CAN interface is connected to UART0 (Tx0/Rx0) pins.
+ * This firmware implements a USB to CAN bus adapter using:
+ * - ESP32-C6's built-in TWAI (CAN controller)
+ * - SN65HVD230 CAN transceiver (physical layer)
+ *
+ * Hardware connections:
+ * - ESP32-C6 GPIO0  → SN65HVD230 D (TXD)
+ * - ESP32-C6 GPIO1  → SN65HVD230 R (RXD)
+ * - ESP32-C6 3.3V   → SN65HVD230 VCC
+ * - ESP32-C6 GND    → SN65HVD230 GND
+ * - SN65HVD230 Rs   → 10kΩ to GND (high-speed mode)
+ * - SN65HVD230 CANH → CAN Bus CANH (with 120Ω termination)
+ * - SN65HVD230 CANL → CAN Bus CANL (with 120Ω termination)
+ * - 100nF capacitor between VCC and GND (close to transceiver)
  *
  * Features:
- * - USB CDC (serial) interface for host communication
- * - CAN 2.0A/2.0B support via TWAI (Two-Wire Automotive Interface)
- * - SLCAN protocol support for compatibility with standard tools
- * - LED status indicators
+ * - USB CDC (serial) interface for host communication (/dev/ttyACM*)
+ * - SLCAN protocol support for compatibility with can-utils
+ * - CAN 2.0A/2.0B support via TWAI
+ * - Configurable bitrates (125k, 250k, 500k, 1M)
+ * - LED status indicator
  */
 
-// Disable USB output for ESP_LOG to prevent interference with SLCAN protocol
-// Set to ESP_LOG_NONE for production use with slcan_attach/slcand
-// Set to ESP_LOG_INFO for debugging via JTAG monitor
-#define LOG_LOCAL_LEVEL ESP_LOG_NONE
+// Set log level - use ESP_LOG_NONE for production with slcan tools
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO
 
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "driver/twai.h"
 #include "driver/usb_serial_jtag.h"
@@ -29,33 +38,12 @@
 
 static const char *TAG = "USB2CAN";
 
-// Debug configuration
-// Set to 0 to disable verbose CAN message logging
-//
-// WARNING: When set to 1, debug logs will be mixed with SLCAN protocol data
-// on the USB serial port. This can interfere with Python scripts trying to
-// parse SLCAN responses. Set to 0 for production use with Python scripts.
-//
-// Recommendation:
-//   - Set to 1: During firmware development/debugging (monitor with idf.py monitor)
-//   - Set to 0: When using Python scripts to control the motor
-#define DEBUG_CAN_MESSAGES 0
+// ESP32-C6 TWAI (CAN) pins - connects to SN65HVD230
+#define TWAI_TX_GPIO    GPIO_NUM_0  // → SN65HVD230 D pin
+#define TWAI_RX_GPIO    GPIO_NUM_1  // → SN65HVD230 R pin
 
-// ESP32-C6 Mini TWAI (CAN) pins
-// Note: For ESP32-C6, UART0 pins are typically GPIO16 (TX) and GPIO17 (RX)
-// However, we'll use the default TWAI pins which are more suitable for CAN
-#define TWAI_TX_GPIO    GPIO_NUM_0  // CAN TX
-#define TWAI_RX_GPIO    GPIO_NUM_1  // CAN RX
-
-// LED indicator (GPIO8 on ESP32-C6)
+// LED indicator
 #define LED_GPIO        GPIO_NUM_8
-
-// CAN timing configuration (500 kbps)
-#define CAN_TIMING_CONFIG_500KBITS() {.brp = 8, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false}
-
-// Queues for CAN message handling
-static QueueHandle_t can_tx_queue;
-static QueueHandle_t can_rx_queue;
 
 // SLCAN protocol state
 typedef enum {
@@ -64,41 +52,65 @@ typedef enum {
     SLCAN_STATE_LISTEN
 } slcan_state_t;
 
-// Auto-open SLCAN at startup for compatibility with slcan_attach
-// Set to SLCAN_STATE_OPEN for immediate operation, or SLCAN_STATE_CLOSED
-// to require explicit 'O' command from host
 static slcan_state_t slcan_state = SLCAN_STATE_CLOSED;
 static uint8_t usb_rx_buffer[256];
 static size_t usb_rx_pos = 0;
 
-// Initialize TWAI (CAN) driver
-static void init_twai(void)
+// Current bitrate configuration
+static uint32_t current_bitrate = 500000; // Default 500kbps
+
+// Bitrate configurations for different speeds
+typedef struct {
+    uint32_t baudrate;
+    twai_timing_config_t timing;
+} bitrate_config_t;
+
+// Predefined bitrates (optimized for ESP32-C6 at 80MHz APB clock)
+static const bitrate_config_t bitrate_configs[] = {
+    {125000,  {.brp = 32, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false}},
+    {250000,  {.brp = 16, .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false}},
+    {500000,  {.brp = 8,  .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false}},
+    {1000000, {.brp = 4,  .tseg_1 = 15, .tseg_2 = 4, .sjw = 3, .triple_sampling = false}},
+};
+
+// Initialize TWAI (CAN controller)
+static esp_err_t init_twai(uint32_t bitrate)
 {
+    // Find matching bitrate config
+    const twai_timing_config_t *timing = NULL;
+    for (int i = 0; i < sizeof(bitrate_configs) / sizeof(bitrate_configs[0]); i++) {
+        if (bitrate_configs[i].baudrate == bitrate) {
+            timing = &bitrate_configs[i].timing;
+            break;
+        }
+    }
+
+    if (!timing) {
+        ESP_LOGE(TAG, "Unsupported bitrate: %lu", bitrate);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     // Configure TWAI general settings
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(TWAI_TX_GPIO, TWAI_RX_GPIO, TWAI_MODE_NORMAL);
     g_config.tx_queue_len = 10;
     g_config.rx_queue_len = 10;
-    // Enable alerts for error monitoring
-    g_config.alerts_enabled = TWAI_ALERT_ALL;
-
-    // Configure TWAI timing (500 kbps)
-    twai_timing_config_t t_config = CAN_TIMING_CONFIG_500KBITS();
+    g_config.alerts_enabled = TWAI_ALERT_ABOVE_ERR_WARN | TWAI_ALERT_BUS_ERROR | TWAI_ALERT_TX_FAILED |
+                              TWAI_ALERT_RX_QUEUE_FULL | TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED;
 
     // Configure TWAI filter (accept all messages)
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     // Install TWAI driver
-    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "TWAI driver installed successfully");
-        ESP_LOGI(TAG, "  - TX Pin: GPIO%d", TWAI_TX_GPIO);
-        ESP_LOGI(TAG, "  - RX Pin: GPIO%d", TWAI_RX_GPIO);
-        ESP_LOGI(TAG, "  - Mode: Normal");
-        ESP_LOGI(TAG, "  - Bitrate: 500 kbps");
-    } else {
+    esp_err_t err = twai_driver_install(&g_config, timing, &f_config);
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to install TWAI driver: %s", esp_err_to_name(err));
-        return;
+        return err;
     }
+
+    ESP_LOGI(TAG, "TWAI driver installed successfully");
+    ESP_LOGI(TAG, "  TX Pin: GPIO%d → SN65HVD230 D", TWAI_TX_GPIO);
+    ESP_LOGI(TAG, "  RX Pin: GPIO%d → SN65HVD230 R", TWAI_RX_GPIO);
+    ESP_LOGI(TAG, "  Bitrate: %lu bps", bitrate);
 
     // Start TWAI driver
     err = twai_start();
@@ -106,7 +118,18 @@ static void init_twai(void)
         ESP_LOGI(TAG, "TWAI driver started - CAN bus active");
     } else {
         ESP_LOGE(TAG, "Failed to start TWAI driver: %s", esp_err_to_name(err));
+        twai_driver_uninstall();
+        return err;
     }
+
+    return ESP_OK;
+}
+
+// Deinitialize TWAI
+static void deinit_twai(void)
+{
+    twai_stop();
+    twai_driver_uninstall();
 }
 
 // Initialize USB Serial JTAG
@@ -120,6 +143,7 @@ static void init_usb_serial(void)
     esp_err_t err = usb_serial_jtag_driver_install(&usb_serial_config);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "USB Serial JTAG driver installed");
+        ESP_LOGI(TAG, "  Device will appear as /dev/ttyACM* on Linux");
     } else {
         ESP_LOGE(TAG, "Failed to install USB Serial JTAG driver: %s", esp_err_to_name(err));
     }
@@ -153,14 +177,10 @@ static void process_slcan_command(const char *cmd, size_t len)
             if (slcan_state == SLCAN_STATE_CLOSED) {
                 slcan_state = SLCAN_STATE_OPEN;
                 usb_serial_jtag_write_bytes("\r", 1, 10);
-#if DEBUG_CAN_MESSAGES
-                ESP_LOGI(TAG, "SLCAN: Channel OPENED (normal mode)");
-#endif
+                ESP_LOGI(TAG, "SLCAN: Channel OPENED");
             } else {
                 usb_serial_jtag_write_bytes("\x07", 1, 10); // Bell (error)
-#if DEBUG_CAN_MESSAGES
-                ESP_LOGW(TAG, "SLCAN: Open failed - channel already open");
-#endif
+                ESP_LOGW(TAG, "SLCAN: Channel already open");
             }
             break;
 
@@ -168,60 +188,54 @@ static void process_slcan_command(const char *cmd, size_t len)
             if (slcan_state == SLCAN_STATE_CLOSED) {
                 slcan_state = SLCAN_STATE_LISTEN;
                 usb_serial_jtag_write_bytes("\r", 1, 10);
-#if DEBUG_CAN_MESSAGES
-                ESP_LOGI(TAG, "SLCAN: Channel OPENED (listen-only mode)");
-#endif
+                ESP_LOGI(TAG, "SLCAN: Channel OPENED (listen-only)");
             } else {
                 usb_serial_jtag_write_bytes("\x07", 1, 10);
-#if DEBUG_CAN_MESSAGES
-                ESP_LOGW(TAG, "SLCAN: Listen-only open failed - channel already open");
-#endif
+                ESP_LOGW(TAG, "SLCAN: Channel already open");
             }
             break;
 
         case 'C': // Close CAN channel
             slcan_state = SLCAN_STATE_CLOSED;
             usb_serial_jtag_write_bytes("\r", 1, 10);
-#if DEBUG_CAN_MESSAGES
             ESP_LOGI(TAG, "SLCAN: Channel CLOSED");
-#endif
             break;
 
         case 'S': // Setup with standard CAN bit-rates
             if (slcan_state == SLCAN_STATE_CLOSED && len >= 2) {
-                // S0-S8: 10k, 20k, 50k, 100k, 125k, 250k, 500k, 800k, 1000k
-                usb_serial_jtag_write_bytes("\r", 1, 10);
-#if DEBUG_CAN_MESSAGES
-                const char* bitrates[] = {"10k", "20k", "50k", "100k", "125k", "250k", "500k", "800k", "1M"};
+                // S0=10k, S1=20k, S2=50k, S3=100k, S4=125k, S5=250k, S6=500k, S7=800k, S8=1M
+                const uint32_t bitrates[] = {10000, 20000, 50000, 100000, 125000, 250000, 500000, 800000, 1000000};
                 int idx = cmd[1] - '0';
+
                 if (idx >= 0 && idx <= 8) {
-                    ESP_LOGI(TAG, "SLCAN: Bitrate set to S%d (%s bps)", idx, bitrates[idx]);
+                    deinit_twai();
+                    if (init_twai(bitrates[idx]) == ESP_OK) {
+                        current_bitrate = bitrates[idx];
+                        usb_serial_jtag_write_bytes("\r", 1, 10);
+                        ESP_LOGI(TAG, "SLCAN: Bitrate set to %lu bps", bitrates[idx]);
+                    } else {
+                        usb_serial_jtag_write_bytes("\x07", 1, 10);
+                        ESP_LOGE(TAG, "SLCAN: Failed to set bitrate");
+                    }
                 } else {
-                    ESP_LOGI(TAG, "SLCAN: Bitrate command S%c", cmd[1]);
+                    usb_serial_jtag_write_bytes("\x07", 1, 10);
                 }
-#endif
             } else {
                 usb_serial_jtag_write_bytes("\x07", 1, 10);
-#if DEBUG_CAN_MESSAGES
-                ESP_LOGW(TAG, "SLCAN: Bitrate set failed - channel must be closed");
-#endif
+                ESP_LOGW(TAG, "SLCAN: Channel must be closed to change bitrate");
             }
             break;
 
         case 'V': // Get hardware version
             snprintf(response, sizeof(response), "V0101\r");
             usb_serial_jtag_write_bytes(response, strlen(response), 10);
-#if DEBUG_CAN_MESSAGES
-            ESP_LOGI(TAG, "SLCAN: Version query - V0101");
-#endif
+            ESP_LOGI(TAG, "SLCAN: Version query");
             break;
 
         case 'N': // Get serial number
             snprintf(response, sizeof(response), "N2024\r");
             usb_serial_jtag_write_bytes(response, strlen(response), 10);
-#if DEBUG_CAN_MESSAGES
-            ESP_LOGI(TAG, "SLCAN: Serial number query - N2024");
-#endif
+            ESP_LOGI(TAG, "SLCAN: Serial number query");
             break;
 
         case 't': // Transmit standard frame
@@ -250,20 +264,12 @@ static void process_slcan_command(const char *cmd, size_t len)
                     }
                 }
 
-                // Send message
+                // Send message via TWAI → SN65HVD230 → CAN bus
                 esp_err_t err = twai_transmit(&tx_msg, pdMS_TO_TICKS(100));
                 if (err == ESP_OK) {
                     usb_serial_jtag_write_bytes("z\r", 2, 10); // Success
-
-#if DEBUG_CAN_MESSAGES
-                    // Log TX message to monitor (only if debugging enabled)
-                    ESP_LOGI(TAG, "CAN TX: ID=0x%03X %s DLC=%d Data=[%02X %02X %02X %02X %02X %02X %02X %02X]",
-                             tx_msg.identifier,
-                             tx_msg.extd ? "EXT" : "STD",
-                             tx_msg.data_length_code,
-                             tx_msg.data[0], tx_msg.data[1], tx_msg.data[2], tx_msg.data[3],
-                             tx_msg.data[4], tx_msg.data[5], tx_msg.data[6], tx_msg.data[7]);
-#endif
+                    ESP_LOGI(TAG, "CAN TX: ID=0x%03lX %s DLC=%d",
+                             tx_msg.identifier, tx_msg.extd ? "EXT" : "STD", tx_msg.data_length_code);
                 } else {
                     usb_serial_jtag_write_bytes("\x07", 1, 10); // Error
                     ESP_LOGE(TAG, "CAN TX Failed: %s", esp_err_to_name(err));
@@ -275,13 +281,16 @@ static void process_slcan_command(const char *cmd, size_t len)
 
         default:
             usb_serial_jtag_write_bytes("\x07", 1, 10); // Unknown command
+            ESP_LOGW(TAG, "SLCAN: Unknown command '%c'", cmd[0]);
             break;
     }
 }
 
-// Task to handle USB to CAN direction
+// Task to handle USB to CAN direction (SLCAN commands)
 static void usb_to_can_task(void *arg)
 {
+    ESP_LOGI(TAG, "USB→CAN task started");
+
     while (1) {
         // Read from USB
         int len = usb_serial_jtag_read_bytes(usb_rx_buffer + usb_rx_pos,
@@ -293,7 +302,6 @@ static void usb_to_can_task(void *arg)
             // Process complete commands (terminated by \r or \n)
             for (size_t i = 0; i < usb_rx_pos; i++) {
                 if (usb_rx_buffer[i] == '\r' || usb_rx_buffer[i] == '\n') {
-                    // Found command terminator
                     usb_rx_buffer[i] = '\0';
                     process_slcan_command((char *)usb_rx_buffer, i);
 
@@ -303,13 +311,13 @@ static void usb_to_can_task(void *arg)
                         memmove(usb_rx_buffer, usb_rx_buffer + i + 1, remaining);
                     }
                     usb_rx_pos = remaining;
-                    i = 0; // Restart parsing
+                    i = 0;
                 }
             }
 
             // Prevent buffer overflow
             if (usb_rx_pos >= sizeof(usb_rx_buffer) - 1) {
-                ESP_LOGW(TAG, "USB RX buffer overflow, clearing");
+                ESP_LOGW(TAG, "USB RX buffer overflow");
                 usb_rx_pos = 0;
             }
         }
@@ -318,25 +326,19 @@ static void usb_to_can_task(void *arg)
     }
 }
 
-// Task to handle CAN to USB direction
+// Task to handle CAN to USB direction (receive CAN messages)
 static void can_to_usb_task(void *arg)
 {
     twai_message_t rx_msg;
     char tx_buffer[64];
 
+    ESP_LOGI(TAG, "CAN→USB task started");
+
     while (1) {
-        // Wait for CAN message
+        // Wait for CAN message from SN65HVD230 → TWAI
         if (twai_receive(&rx_msg, pdMS_TO_TICKS(10)) == ESP_OK) {
-#if DEBUG_CAN_MESSAGES
-            // Log RX message to monitor (only if debugging enabled)
-            ESP_LOGI(TAG, "CAN RX: ID=0x%03X %s %s DLC=%d Data=[%02X %02X %02X %02X %02X %02X %02X %02X]",
-                     rx_msg.identifier,
-                     rx_msg.extd ? "EXT" : "STD",
-                     rx_msg.rtr ? "RTR" : "   ",
-                     rx_msg.data_length_code,
-                     rx_msg.data[0], rx_msg.data[1], rx_msg.data[2], rx_msg.data[3],
-                     rx_msg.data[4], rx_msg.data[5], rx_msg.data[6], rx_msg.data[7]);
-#endif
+            ESP_LOGI(TAG, "CAN RX: ID=0x%03lX %s DLC=%d",
+                     rx_msg.identifier, rx_msg.extd ? "EXT" : "STD", rx_msg.data_length_code);
 
             if (slcan_state != SLCAN_STATE_CLOSED) {
                 // Format message in SLCAN format
@@ -384,46 +386,38 @@ static void can_status_task(void *arg)
 
     while (1) {
         // Check for alerts
-        twai_read_alerts(&alerts, pdMS_TO_TICKS(0));
-
-        if (alerts & TWAI_ALERT_ERR_PASS) {
-            ESP_LOGW(TAG, "CAN: Alert - Error Passive state");
-        }
-        if (alerts & TWAI_ALERT_BUS_ERROR) {
-            ESP_LOGW(TAG, "CAN: Alert - Bus error detected");
-        }
-        if (alerts & TWAI_ALERT_TX_FAILED) {
-            ESP_LOGW(TAG, "CAN: Alert - TX failed (arbitration lost or error)");
-        }
-        if (alerts & TWAI_ALERT_RX_QUEUE_FULL) {
-            ESP_LOGW(TAG, "CAN: Alert - RX queue full, messages lost!");
-        }
-        if (alerts & TWAI_ALERT_TX_SUCCESS) {
-            ESP_LOGD(TAG, "CAN: Alert - TX successful");
-        }
-        if (alerts & TWAI_ALERT_BUS_OFF) {
-            ESP_LOGE(TAG, "CAN: Alert - Bus OFF! Starting recovery...");
-            twai_initiate_recovery();
-        }
-        if (alerts & TWAI_ALERT_BUS_RECOVERED) {
-            ESP_LOGI(TAG, "CAN: Alert - Bus recovered from Bus OFF");
+        if (twai_read_alerts(&alerts, pdMS_TO_TICKS(10)) == ESP_OK) {
+            if (alerts & TWAI_ALERT_ABOVE_ERR_WARN) {
+                ESP_LOGW(TAG, "CAN: Surpassed error warning threshold");
+            }
+            if (alerts & TWAI_ALERT_BUS_ERROR) {
+                ESP_LOGW(TAG, "CAN: Bus error detected");
+            }
+            if (alerts & TWAI_ALERT_TX_FAILED) {
+                ESP_LOGW(TAG, "CAN: TX failed (no ACK or arbitration lost)");
+            }
+            if (alerts & TWAI_ALERT_RX_QUEUE_FULL) {
+                ESP_LOGW(TAG, "CAN: RX queue full - messages lost!");
+            }
+            if (alerts & TWAI_ALERT_BUS_OFF) {
+                ESP_LOGE(TAG, "CAN: BUS OFF! Starting recovery...");
+                twai_initiate_recovery();
+            }
+            if (alerts & TWAI_ALERT_BUS_RECOVERED) {
+                ESP_LOGI(TAG, "CAN: Bus recovered from Bus-Off");
+            }
         }
 
-        // Periodic status logging every 10 seconds
+        // Periodic status check every 30 seconds
         static uint32_t last_status_time = 0;
         uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        if (current_time - last_status_time >= 10000) {
+        if (current_time - last_status_time >= 30000) {
             if (twai_get_status_info(&status) == ESP_OK) {
-                ESP_LOGI(TAG, "CAN Status: State=%s, TxErr=%d, RxErr=%d, TxQ=%d, RxQ=%d, Arb=%d",
+                ESP_LOGI(TAG, "CAN Status: State=%s, TxErr=%lu, RxErr=%lu",
                          (status.state == TWAI_STATE_RUNNING) ? "RUNNING" :
-                         (status.state == TWAI_STATE_BUS_OFF) ? "BUS_OFF" :
-                         (status.state == TWAI_STATE_RECOVERING) ? "RECOVERING" : "STOPPED",
-                         status.tx_error_counter,
-                         status.rx_error_counter,
-                         status.msgs_to_tx,
-                         status.msgs_to_rx,
-                         status.arb_lost_count);
+                         (status.state == TWAI_STATE_BUS_OFF) ? "BUS_OFF" : "STOPPED",
+                         status.tx_error_counter, status.rx_error_counter);
             }
             last_status_time = current_time;
         }
@@ -432,7 +426,7 @@ static void can_status_task(void *arg)
     }
 }
 
-// LED blink task
+// LED blink task (shows device is alive)
 static void led_task(void *arg)
 {
     gpio_reset_pin(LED_GPIO);
@@ -440,9 +434,9 @@ static void led_task(void *arg)
 
     while (1) {
         gpio_set_level(LED_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(100));
         gpio_set_level(LED_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(900));
     }
 }
 
@@ -450,19 +444,22 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  ESP32-C6 USB to CAN Adapter");
-    ESP_LOGI(TAG, "  Firmware Version: 1.0.0");
+    ESP_LOGI(TAG, "  with SN65HVD230 Transceiver");
+    ESP_LOGI(TAG, "  Firmware Version: 2.0.0");
     ESP_LOGI(TAG, "========================================");
 
     // Initialize USB Serial
     ESP_LOGI(TAG, "Initializing USB Serial JTAG...");
     init_usb_serial();
 
-    // Initialize TWAI (CAN)
-    ESP_LOGI(TAG, "Initializing TWAI (CAN) driver...");
-    init_twai();
+    // Initialize TWAI (CAN controller) with default bitrate
+    ESP_LOGI(TAG, "Initializing TWAI (CAN Controller)...");
+    if (init_twai(current_bitrate) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize TWAI - check connections!");
+    }
 
     // Create tasks
-    ESP_LOGI(TAG, "Creating tasks...");
+    ESP_LOGI(TAG, "Creating communication tasks...");
     xTaskCreate(usb_to_can_task, "usb_to_can", 4096, NULL, 5, NULL);
     xTaskCreate(can_to_usb_task, "can_to_usb", 4096, NULL, 5, NULL);
     xTaskCreate(can_status_task, "can_status", 3072, NULL, 4, NULL);
@@ -470,7 +467,19 @@ void app_main(void)
 
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  USB2CAN Adapter Ready!");
-    ESP_LOGI(TAG, "  Connect via USB and use SLCAN protocol");
-    ESP_LOGI(TAG, "  All CAN messages will be logged below");
+    ESP_LOGI(TAG, "  USB: /dev/ttyACM*");
+    ESP_LOGI(TAG, "  CAN: GPIO0/1 → SN65HVD230");
+    ESP_LOGI(TAG, "  Protocol: SLCAN");
+    ESP_LOGI(TAG, "  Default Bitrate: %lu bps", current_bitrate);
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Hardware Checklist:");
+    ESP_LOGI(TAG, "  [?] GPIO0 → SN65HVD230 pin 1 (D/TXD)");
+    ESP_LOGI(TAG, "  [?] GPIO1 → SN65HVD230 pin 4 (R/RXD)");
+    ESP_LOGI(TAG, "  [?] 3.3V → SN65HVD230 pin 3 (VCC)");
+    ESP_LOGI(TAG, "  [?] GND → SN65HVD230 pin 2 (GND)");
+    ESP_LOGI(TAG, "  [?] Rs pin 8 → 10kΩ to GND");
+    ESP_LOGI(TAG, "  [?] 100nF cap between VCC and GND");
+    ESP_LOGI(TAG, "  [?] 120Ω termination resistors installed");
     ESP_LOGI(TAG, "========================================");
 }
