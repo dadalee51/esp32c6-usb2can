@@ -1,0 +1,118 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build - Build project",
+            "type": "shell",
+            "command": "${config:idf.pythonBinPath} ${config:idf.espIdfPath}/tools/idf.py build",
+            "windows": {
+                "command": "${config:idf.pythonBinPathWin} ${config:idf.espIdfPath}/tools/idf.py build",
+                "options": {
+                    "env": {
+                        "PATH": "${env:PATH};${config:idf.customExtraPaths}"
+                    }
+                }
+            },
+            "options": {
+                "env": {
+                    "PATH": "${env:PATH}:${config:idf.customExtraPaths}"
+                }
+            },
+            "problemMatcher": [
+                {
+                    "owner": "cpp",
+                    "fileLocation": "absolute",
+                    "pattern": {
+                        "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error):\\s+(.*)$",
+                        "file": 1,
+                        "line": 2,
+                        "column": 3,
+                        "severity": 4,
+                        "message": 5
+                    }
+                }
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "Set ESP-IDF Target to esp32c6",
+            "type": "shell",
+            "command": "${config:idf.pythonBinPath} ${config:idf.espIdfPath}/tools/idf.py set-target esp32c6",
+            "windows": {
+                "command": "${config:idf.pythonBinPathWin} ${config:idf.espIdfPath}/tools/idf.py set-target esp32c6",
+                "options": {
+                    "env": {
+                        "PATH": "${env:PATH};${config:idf.customExtraPaths}"
+                    }
+                }
+            },
+            "options": {
+                "env": {
+                    "PATH": "${env:PATH}:${config:idf.customExtraPaths}"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Clean - Clean the project",
+            "type": "shell",
+            "command": "${config:idf.pythonBinPath} ${config:idf.espIdfPath}/tools/idf.py fullclean",
+            "windows": {
+                "command": "${config:idf.pythonBinPathWin} ${config:idf.espIdfPath}/tools/idf.py fullclean",
+                "options": {
+                    "env": {
+                        "PATH": "${env:PATH};${config:idf.customExtraPaths}"
+                    }
+                }
+            },
+            "options": {
+                "env": {
+                    "PATH": "${env:PATH}:${config:idf.customExtraPaths}"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Flash - Flash the device",
+            "type": "shell",
+            "command": "${config:idf.pythonBinPath} ${config:idf.espIdfPath}/tools/idf.py -p ${config:idf.port} flash",
+            "windows": {
+                "command": "${config:idf.pythonBinPathWin} ${config:idf.espIdfPath}/tools/idf.py -p ${config:idf.portWin} flash",
+                "options": {
+                    "env": {
+                        "PATH": "${env:PATH};${config:idf.customExtraPaths}"
+                    }
+                }
+            },
+            "options": {
+                "env": {
+                    "PATH": "${env:PATH}:${config:idf.customExtraPaths}"
+                }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Monitor - Start the monitor",
+            "type": "shell",
+            "command": "${config:idf.pythonBinPath} ${config:idf.espIdfPath}/tools/idf.py -p ${config:idf.port} monitor",
+            "windows": {
+                "command": "${config:idf.pythonBinPathWin} ${config:idf.espIdfPath}/tools/idf.py -p ${config:idf.portWin} monitor",
+                "options": {
+                    "env": {
+                        "PATH": "${env:PATH};${config:idf.customExtraPaths}"
+                    }
+                }
+            },
+            "options": {
+                "env": {
+                    "PATH": "${env:PATH}:${config:idf.customExtraPaths}"
+                }
+            },
+            "problemMatcher": [],
+            "isBackground": true
+        }
+    ]
+}
