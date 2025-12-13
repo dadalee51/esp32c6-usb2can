@@ -39,8 +39,8 @@
 static const char *TAG = "USB2CAN";
 
 // ESP32-C6 TWAI (CAN) pins - connects to SN65HVD230
-#define TWAI_TX_GPIO    GPIO_NUM_0  // → SN65HVD230 D pin
-#define TWAI_RX_GPIO    GPIO_NUM_1  // → SN65HVD230 R pin
+#define TWAI_TX_GPIO    GPIO_NUM_16  // → SN65HVD230 D pin
+#define TWAI_RX_GPIO    GPIO_NUM_17  // → SN65HVD230 R pin
 
 // LED indicator
 #define LED_GPIO        GPIO_NUM_8
